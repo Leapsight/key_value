@@ -26,7 +26,7 @@
 -define(BADKEY, '$error_badkey').
 
 -type t()           ::  map() | [proplists:property()].
--type key()         ::  atom() | binary() | tuple() | [atom() | binary()].
+-type key()         ::  term() | [term()].
 
 -export_type([t/0]).
 -export_type([key/0]).
@@ -34,6 +34,9 @@
 -export([get/2]).
 -export([get/3]).
 -export([set/3]).
+-export([put/3]).
+-export([remove/2]).
+-export([take/2]).
 
 -compile({no_auto_import, [get/1]}).
 
@@ -47,8 +50,7 @@
 
 %% -----------------------------------------------------------------------------
 %% @doc Returns value `Value' associated with `Key' if `KVTerm' contains `Key'.
-%% `Key' can be an atom, a binary or a path represented as a list of atoms and/
-%% or binaries, or as a tuple of atoms and/or binaries.
+%% `Key' can be a term or a path represented as a list of terms.
 %%
 %% The call fails with a {badarg, `KVTerm'} exception if `KVTerm' is not a
 %% property list or map. It also fails with a {badkey, `Key'} exception if no
@@ -66,9 +68,6 @@ get(Key, KVTerm) ->
 %% @end
 %% -----------------------------------------------------------------------------
 -spec get(Key :: key(), KVTerm :: t(), Default :: term()) -> term().
-
-get(Key, KVTerm, Default) when is_tuple(Key) ->
-    get(tuple_to_list(Key), KVTerm, Default);
 
 get([], _, _) ->
     error(badkey);
@@ -118,36 +117,116 @@ get(_, _, _) ->
 %% @doc
 %% @end
 %% -----------------------------------------------------------------------------
--spec set(Key :: key(), Value :: any(), KVTerm :: t()) -> ok.
+-spec set(Key :: key(), Value :: any(), KVTerm :: t()) -> NewKVTerm :: t().
 
-set(Key, Value, KVTerm) when is_tuple(Key) ->
-    set(tuple_to_list(Key), Value, KVTerm);
+set(Key, Value, KVTerm) ->
+    put(Key, Value, KVTerm).
 
-set([H|[]], Value, KVTerm) ->
-    set(H, Value, KVTerm);
 
-set([H|T], Value, KVTerm)
-when (is_atom(H) orelse is_binary(H)) andalso is_list(KVTerm)->
-    InnerTerm = set(T, Value, get(H, KVTerm, [])),
+%% -----------------------------------------------------------------------------
+%% @doc
+%% If Key is a tuple it will be treated as a list
+%% @end
+%% -----------------------------------------------------------------------------
+-spec put(Key :: key(), Value :: any(), KVTerm :: t()) -> NewKVTerm :: t().
+
+put([H|[]], Value, KVTerm) ->
+    put(H, Value, KVTerm);
+
+put([H|T], Value, KVTerm) when is_list(KVTerm) ->
+    InnerTerm = put(T, Value, get(H, KVTerm, [])),
     lists:keystore(H, 1, KVTerm, {H, InnerTerm});
 
-set([H|T], Value, KVTerm)
-when (is_atom(H) orelse is_binary(H)) andalso is_map(KVTerm)->
-    InnerTerm = set(T, Value, get(H, KVTerm, [])),
+put([H|T], Value, KVTerm) when is_map(KVTerm) ->
+    InnerTerm = put(T, Value, get(H, KVTerm, [])),
     maps:put(H, InnerTerm, KVTerm);
 
-set([], _, _)  ->
+put([], _, _)  ->
     error(badkey);
 
-set(Key, Value, KVTerm)
-when (is_atom(Key) orelse is_binary(Key)) andalso is_list(KVTerm) ->
+put(Key, Value, KVTerm) when is_list(KVTerm) ->
     lists:keystore(Key, 1, KVTerm, {Key, Value});
 
-set(Key, Value, KVTerm)
-when (is_atom(Key) orelse is_binary(Key)) andalso is_map(KVTerm) ->
+put(Key, Value, KVTerm) when is_map(KVTerm) ->
     maps:put(Key, Value, KVTerm);
 
-set(_, _, _) ->
+put(_, _, _) ->
+    error(badarg).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec remove(Key :: key(), KVTerm :: t()) -> NewKVTerm :: t().
+
+
+remove([H|[]], KVTerm) ->
+    remove(H, KVTerm);
+
+remove([H|T], KVTerm) when is_list(KVTerm) ->
+    InnerTerm = remove(T, get(H, KVTerm, [])),
+    lists:keystore(H, 1, KVTerm, {H, InnerTerm});
+
+remove([H|T], KVTerm) when is_map(KVTerm) ->
+    InnerTerm = remove(T, get(H, KVTerm, [])),
+    maps:put(H, InnerTerm, KVTerm);
+
+remove([], _)  ->
+    error(badkey);
+
+remove(Key, KVTerm) when is_list(KVTerm) ->
+    lists:keydelete(Key, 1, KVTerm);
+
+remove(Key, KVTerm) when is_map(KVTerm) ->
+    maps:remove(Key, KVTerm);
+
+remove(_, _) ->
+    error(badarg).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec take(Key :: key(), KVTerm :: t()) ->
+    {Value :: term(), NewKVTerm :: t()} | error.
+
+
+take([H|[]], KVTerm) ->
+    take(H, KVTerm);
+
+take([H|T], KVTerm) when is_list(KVTerm) ->
+    case take(T, get(H, KVTerm, [])) of
+        {Val, InnerTerm} ->
+            {Val, lists:keystore(H, 1, KVTerm, {H, InnerTerm})};
+        error ->
+            error
+    end;
+
+take([H|T], KVTerm) when is_map(KVTerm) ->
+    case take(T, get(H, KVTerm, [])) of
+        {Val, InnerTerm} ->
+            {Val, maps:put(H, InnerTerm, KVTerm)};
+        error ->
+            error
+    end;
+
+take([], _)  ->
+    error(badkey);
+
+take(Key, KVTerm) when is_list(KVTerm) ->
+    case lists:keytake(Key, 1, KVTerm) of
+        {value, {Key, Value}, NewKVTerm} ->
+            {Value, NewKVTerm};
+        false ->
+            error
+    end;
+
+take(Key, KVTerm) when is_map(KVTerm) ->
+    maps:take(Key, KVTerm);
+
+take(_, _) ->
     error(badarg).
 
 
