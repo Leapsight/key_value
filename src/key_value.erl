@@ -1,7 +1,7 @@
 %% =============================================================================
 %%  key_value.erl -
 %%
-%%  Copyright (c) 2016-2020 Leapsight Holdings Limited. All rights reserved.
+%%  Copyright (c) 2016-2023 Leapsight Technologies Limited. All rights reserved.
 %%
 %%  Licensed under the Apache License, Version 2.0 (the "License");
 %%  you may not use this file except in compliance with the License.
@@ -18,25 +18,58 @@
 
 
 %% -----------------------------------------------------------------------------
-%% @doc A Key Value coding interface for property lists and maps.
+%% @doc A Key-Value coding interface for property lists and maps.
 %% @end
 %% -----------------------------------------------------------------------------
 -module(key_value).
 
 -define(BADKEY, '$error_badkey').
+-define(COLLECT_VALUES, '$collect_values').
+-define(DEFAULT_COLLECT_OPTS, #{
+    '$collect_values' => false,
+    default => ?BADKEY,
+    on_badkey => default,
+    return => list
+}).
 
--type t()           ::  map() | [proplists:property()].
--type key()         ::  term() | [term()].
+-type t()               ::  map() | [proplists:property()].
+-type key()             ::  term() | [term()].
+-type fold_fun()        ::  fun(
+                            (Key :: any(), Value :: any(), AccIn :: any()) ->
+                                AccOut :: any()
+                            ).
+-type foreach_fun()     ::  fun((Key :: any(), Value :: any()) -> any()).
+-type collect_opts()    ::  #{
+                                default => any(),
+                                on_badkey => skip | error,
+                                return => map | list
+                            }.
+-type default()         ::  any() | fun(() -> any()).
 
 -export_type([t/0]).
 -export_type([key/0]).
 
+-export([collect/2]).
+-export([collect/3]).
+-export([collect_values/2]).
+-export([collect_values/3]).
+-export([find/2]).
+-export([fold/3]).
+-export([foreach/2]).
 -export([get/2]).
 -export([get/3]).
--export([set/3]).
+-export([get_lazy/3]).
+-export([get_bool/2]).
+-export([is_key/2]).
+-export([keys/1]).
+-export([normalize/1]).
 -export([put/3]).
 -export([remove/2]).
+-export([set/3]).
 -export([take/2]).
+-export([to_list/1]).
+-export([to_map/1]).
+-export([with/2]).
 
 -compile({no_auto_import, [get/1]}).
 
@@ -47,27 +80,85 @@
 %% =============================================================================
 
 
-
 %% -----------------------------------------------------------------------------
-%% @doc Returns value `Value' associated with `Key' if `KVTerm' contains `Key'.
-%% `Key' can be a term or a path represented as a list of terms.
-%%
-%% The call fails with a {badarg, `KVTerm'} exception if `KVTerm' is not a
-%% property list or map. It also fails with a {badkey, `Key'} exception if no
-%% value is associated with `Key'.
+%% @doc
 %% @end
 %% -----------------------------------------------------------------------------
--spec get(Key :: key(), KVTerm :: t()) -> Value :: term().
+-spec normalize(KV :: t()) -> t().
 
-get(Key, KVTerm) ->
-    get(Key, KVTerm, ?BADKEY).
+normalize(KV) when is_list(KV) ->
+    maps:to_list(
+        lists:foldl(
+            fun
+                ({K, V}, Acc) ->
+                    maps:put(K, V, Acc);
+                (K, Acc) when is_atom(K) ->
+                    maps:put(K, true, Acc)
+            end,
+            maps:new(),
+            KV
+        )
+    );
+
+normalize(KV) when is_map(KV) ->
+    KV.
+
 
 
 %% -----------------------------------------------------------------------------
 %% @doc
 %% @end
 %% -----------------------------------------------------------------------------
--spec get(Key :: key(), KVTerm :: t(), Default :: term()) -> term().
+-spec is_key(Key :: key(), KV :: t()) -> boolean().
+
+is_key(Key, KV) when is_list(Key), is_list(KV) ->
+    case get(Key, KV, '$error') of
+        '$error' ->
+            false;
+        _ ->
+            true
+    end;
+
+is_key(Key, KV) when is_list(KV) ->
+    proplists:is_defined(Key, KV);
+
+is_key(Key, KV) when is_map(KV) ->
+    maps:is_key(Key, KV).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec keys(KV :: t()) -> [key()].
+
+keys(KV) when is_list(KV) ->
+    proplists:get_keys(KV);
+
+keys(KV) when is_map(KV) ->
+    maps:keys(KV).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Returns value `Value' associated with `Key' if `KV' contains `Key'.
+%% `Key' can be a term or a path represented as a list of terms.
+%%
+%% The call fails with a {badarg, `KV'} exception if `KV' is not a
+%% property list or map. It also fails with a {badkey, `Key'} exception if no
+%% value is associated with `Key'.
+%% @end
+%% -----------------------------------------------------------------------------
+-spec get(Key :: key(), KV :: t()) -> Value :: term().
+
+get(Key, KV) ->
+    get(Key, KV, ?BADKEY).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec get(Key :: key(), KV :: t(), Default :: default()) -> term().
 
 get([], _, _) ->
     error(badkey);
@@ -75,52 +166,329 @@ get([], _, _) ->
 get(_, [], Default) ->
     maybe_badkey(Default);
 
-get(_, KVTerm, Default) when is_map(KVTerm) andalso map_size(KVTerm) == 0 ->
+get(_, KV, Default) when is_map(KV) andalso map_size(KV) == 0 ->
     maybe_badkey(Default);
 
-get([H|[]], KVTerm, Default) ->
-    get(H, KVTerm, Default);
+get([H|[]], KV, Default) ->
+    get(H, KV, Default);
 
-get([H|T], KVTerm, Default) when is_list(KVTerm) ->
-    case lists:keyfind(H, 1, KVTerm) of
+get([H|T], KV, Default) when is_list(KV) ->
+    case lists:keyfind(H, 1, KV) of
         {H, Child} ->
             get(T, Child, Default);
         false ->
-            maybe_badkey(Default)
+            maybe_expand(H, KV, Default)
     end;
 
-get(Key, KVTerm, Default) when is_list(KVTerm) ->
-    case lists:keyfind(Key, 1, KVTerm) of
+get(Key, KV, Default) when is_list(KV) ->
+    case lists:keyfind(Key, 1, KV) of
         {Key, Value} ->
             Value;
         false ->
-            maybe_badkey(Default)
+            maybe_expand(Key, KV, Default)
     end;
 
-get([H|T], KVTerm, Default) when is_map(KVTerm) ->
-    case maps:find(H, KVTerm) of
+get([H|T], KV, Default) when is_map(KV) ->
+    case maps:find(H, KV) of
         {ok, Child} ->
             get(T, Child, Default);
         error ->
             maybe_badkey(Default)
     end;
 
-get(Key, KVTerm, Default) when is_map(KVTerm) ->
-    maybe_badkey(maps:get(Key, KVTerm, Default));
+get(Key, KV, Default) when is_map(KV) ->
+    maybe_badkey(maps:get(Key, KV, Default));
 
 get(_, _, _) ->
     error(badarg).
-
 
 
 %% -----------------------------------------------------------------------------
 %% @doc
 %% @end
 %% -----------------------------------------------------------------------------
--spec set(Key :: key(), Value :: any(), KVTerm :: t()) -> NewKVTerm :: t().
+-spec get_lazy(Key :: key(), KV :: t(), Fun :: fun(() -> any())) -> term().
 
-set(Key, Value, KVTerm) ->
-    put(Key, Value, KVTerm).
+
+get_lazy(Key, KV, Fun) when is_function(Fun, 0) ->
+    try
+        get(Key, KV)
+    catch
+        error:badkey ->
+            Fun()
+    end.
+
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Returns the value of a boolean key/value option. If `get(Key, KV)'
+%% would yield `{Key, true}', this function returns `true', otherwise `false'.
+%%
+%% This is the same as calling `get(Key, KV, false)'.
+%% @end
+%% -----------------------------------------------------------------------------
+-spec get_bool(Key :: key(), KV :: t()) -> boolean().
+
+get_bool(Key, KV) ->
+    get(Key, KV, false).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec find(Key :: key(), KV :: t()) -> {ok, Value :: any()} | error.
+
+find(Key, KV) ->
+    case get(Key, KV, '$error') of
+        '$error' ->
+            error;
+        Value ->
+            {ok, Value}
+    end.
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec with(Keys :: [key()], t()) -> t().
+
+with(Keys, KV) ->
+    collect_values(Keys, KV).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Calls {@link collect/3} with the default options.
+%% @end
+%% -----------------------------------------------------------------------------
+-spec collect([key()], KV :: t()) -> [any()].
+
+collect(Keys, KV) ->
+    %% TODO this is not efficient as we traverse the tree from root for
+    %% every key. We should implement collect_map/2 (which should be
+    %% optimised) and then return the values for the Keys.
+    collect(Keys, KV, ?DEFAULT_COLLECT_OPTS).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Returns a list of values associated with the keys `Keys'.
+%%
+%% ?> The value returned by this function are not raw values, but Babel
+%% datatype values. If you want to get the raw values use
+%% {@link collect_values/3} instead.
+%%
+%% The return depends on the following options:
+%%
+%% * `default' - the value to use as default when a key in `Keys' is not
+%% present in the map `Map'. The presence of a default value disables the
+%% option `on_badkey'.
+%% * `on_badkey' - what happens when a key is not present in the map and there
+%% was no default value provided. Valid values are `skip', or `error'. When
+%% using `skip' the function simply ignores the missing key and returns all
+%% found keys. Using `error' will fail with a `badkey' exception.
+%% * `return` - the Erlang return type of the function. Valid values are `list'
+%% and `map'. Notice that naturally Erlang maps will deduplicate keys whereas
+%% lists would not. Default value: `list'.
+%%
+%% **Examples**:
+%%
+%% <pre lang="erlang"><![CDATA[
+%% Map = #{
+%%         <<"x">> => #{
+%%             <<"a">> => 1,
+%%             <<"b">> => 2
+%%         }
+%%     }.
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect([<<"x">>], Map).
+%% [{key_value,#{<<"a">> => {babel_counter,0,1},
+%%               <<"b">> => {babel_counter,0,2}},
+%%             [<<"a">>,<<"b">>],
+%%             [],undefined}]
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect([<<"y">>], Map).
+%% ** exception error: badkey
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect([<<"y">>], Map, #{on_badkey => skip}).
+%% []
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect([<<"y">>], Map, #{default => undefined}).
+%% [undefined]
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect([<<"x">>], Map, #{return => map}).
+%% #{<<"x">> =>
+%%       {key_value,#{<<"a">> => {babel_counter,0,1},
+%%                    <<"b">> => {babel_counter,0,2}},
+%%                  [<<"a">>,<<"b">>],
+%%                  [],undefined}}
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect(
+%%     [ [<<"x">>, <<"a">>], [<<"x">>, <<"b">>]  ],
+%%     Map,
+%%     #{return => list}
+%% ).
+%% [{babel_counter, 0, 1},{babel_counter, 0, 2}]
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect(
+%%     [ [<<"x">>, <<"a">>], [<<"x">>, <<"b">>]  ],
+%%     Map,
+%%     #{return => map}
+%% ).
+%% #{<<"x">> =>
+%%       #{<<"a">> => {babel_counter,0,1},
+%%         <<"b">> => {babel_counter,0,2}}}
+%% ]]></pre>
+%%
+%% !> The function is not clever in terms of optimisations, so judgment is
+%% required when used. For example if
+%% `Keys = [ [A, B, X], [A, B, Y], [A, B, Z] ]', it will iterate 3 times
+%% traversing the whole path from A to X, A to Y and A to Z i.e. reading A then
+%% B three times. In the future we might want to change this so that [A, B] is
+%% read once.
+%%
+%% @throws badkey
+%% @end
+%% -----------------------------------------------------------------------------
+-spec collect(Keys :: key(), Map :: t(), Opts :: collect_opts()) ->
+    [{key(), any()}] | map().
+
+collect(Keys, Map, Opts0) when is_list(Keys) andalso is_map(Opts0) ->
+    Opts1 = maps:merge(?DEFAULT_COLLECT_OPTS, Opts0),
+    Opts = maps:put(?COLLECT_VALUES, false, Opts1),
+    Acc = case maps:get(return, Opts) of
+        list -> [];
+        map -> maps:new()
+    end,
+    do_collect(Keys, Map, Opts, Acc).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Returns a list of values associated with the keys `Keys'.
+%% Fails with a `{badkey, K}` exeception if any key `K' in `Keys' is not
+%% present in the map.
+%% @end
+%% -----------------------------------------------------------------------------
+-spec collect_values([key()], Map :: t()) -> [any()].
+
+collect_values(Keys, Map) ->
+    collect_values(Keys, Map, ?DEFAULT_COLLECT_OPTS).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Returns a list of values associated with the keys `Keys'.
+%%
+%%
+%% The return depends on the following options:
+%%
+%% * `default' - the value to use as default when a key in `Keys' is not
+%% present in the map `Map'. The presence of a default value disables the
+%% option `on_badkey'.
+%% * `on_badkey' - what happens when a key is not present in the map and there
+%% was no default value provided. Valid values are `skip', or `error'. When
+%% using `skip' the function simply ignores the missing key and returns all
+%% found keys. Using `error' will fail with a `badkey' exception.
+%% * `return` - the Erlang return type of the function. Valid values are `list'
+%% and `map'. Notice that naturally Erlang maps will deduplicate keys whereas
+%% lists would not. Default value: `list'.
+%%
+%% **Examples**:
+%%
+%% <pre lang="erlang"><![CDATA[
+%% Map =
+%%     #{
+%%         <<"x">> => #{
+%%             <<"a">> => 1,
+%%             <<"b">> => 2
+%%         }
+%%     }.
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect_values([<<"x">>], Map).
+%% [#{<<"a">> => 1, <<"b">> => 2}]
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect_values([<<"y">>], Map).
+%% ** exception error: badkey
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect_values([<<"y">>], Map, #{on_badkey => skip}).
+%% []
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect_values([<<"y">>], Map, #{default => undefined}).
+%% [undefined]
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect_values([<<"x">>], Map, #{return => map}).
+%% #{<<"x">> => #{<<"a">> => 1, <<"b">> => 2}}.
+%% ]]></pre>
+%%
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect_values(
+%%     [ [<<"x">>, <<"a">>], [<<"x">>, <<"b">>]  ],
+%%     Map,
+%%     #{return => list}
+%% ).
+%% [1,2]
+%% ]]></pre>
+%% <pre lang="erlang"><![CDATA[
+%% key_value:collect_values(
+%%     [ [<<"x">>, <<"a">>], [<<"x">>, <<"b">>]  ],
+%%     Map,
+%%     #{return => map}
+%% ).
+%% #{<<"x">> => #{<<"a">> => 1, <<"b">> => 2}}
+%% ]]></pre>
+%%
+%% !> The function is not clever in terms of optimisations, so judgment is
+%% required when used. For example if
+%% `Keys = [ [A, B, X], [A, B, Y], [A, B, Z] ]', it will iterate 3 times
+%% traversing the whole path from A to X, Y and Z i.e. reading A then B three
+%% times. In the future we might want to change this so that [A, B] is read
+%% once.
+%%
+%% @throws badkey
+%% @end
+%% -----------------------------------------------------------------------------
+-spec collect_values([key()], Map :: t(), Opts :: collect_opts()) ->
+    [any()] | #{binary() => any()}.
+
+collect_values(Keys, Map, Opts0) ->
+    %% We remove the posibility of a user forcing this function to behave like
+    %% collect_values/3 to maintain the semantics of the API.
+    Opts1 = maps:merge(?DEFAULT_COLLECT_OPTS, Opts0),
+    Opts = maps:put(?COLLECT_VALUES, false, Opts1),
+    do_collect(Keys, Map, Opts, []).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec set(Key :: key(), Value :: any(), KV :: t()) -> NewKV :: t().
+
+set(Key, Value, KV) ->
+    put(Key, Value, KV).
 
 
 %% -----------------------------------------------------------------------------
@@ -128,27 +496,27 @@ set(Key, Value, KVTerm) ->
 %% If Key is a tuple it will be treated as a list
 %% @end
 %% -----------------------------------------------------------------------------
--spec put(Key :: key(), Value :: any(), KVTerm :: t()) -> NewKVTerm :: t().
+-spec put(Key :: key(), Value :: any(), KV :: t()) -> NewKV :: t().
 
-put([H|[]], Value, KVTerm) ->
-    put(H, Value, KVTerm);
+put([H|[]], Value, KV) ->
+    put(H, Value, KV);
 
-put([H|T], Value, KVTerm) when is_list(KVTerm) ->
-    InnerTerm = put(T, Value, get(H, KVTerm, [])),
-    lists:keystore(H, 1, KVTerm, {H, InnerTerm});
+put([H|T], Value, KV) when is_list(KV) ->
+    InnerTerm = put(T, Value, get(H, KV, [])),
+    lists:keystore(H, 1, KV, {H, InnerTerm});
 
-put([H|T], Value, KVTerm) when is_map(KVTerm) ->
-    InnerTerm = put(T, Value, get(H, KVTerm, [])),
-    maps:put(H, InnerTerm, KVTerm);
+put([H|T], Value, KV) when is_map(KV) ->
+    InnerTerm = put(T, Value, get(H, KV, [])),
+    maps:put(H, InnerTerm, KV);
 
 put([], _, _)  ->
     error(badkey);
 
-put(Key, Value, KVTerm) when is_list(KVTerm) ->
-    lists:keystore(Key, 1, KVTerm, {Key, Value});
+put(Key, Value, KV) when is_list(KV) ->
+    lists:keystore(Key, 1, KV, {Key, Value});
 
-put(Key, Value, KVTerm) when is_map(KVTerm) ->
-    maps:put(Key, Value, KVTerm);
+put(Key, Value, KV) when is_map(KV) ->
+    maps:put(Key, Value, KV);
 
 put(_, _, _) ->
     error(badarg).
@@ -158,28 +526,28 @@ put(_, _, _) ->
 %% @doc
 %% @end
 %% -----------------------------------------------------------------------------
--spec remove(Key :: key(), KVTerm :: t()) -> NewKVTerm :: t().
+-spec remove(Key :: key(), KV :: t()) -> NewKV :: t().
 
 
-remove([H|[]], KVTerm) ->
-    remove(H, KVTerm);
+remove([H|[]], KV) ->
+    remove(H, KV);
 
-remove([H|T], KVTerm) when is_list(KVTerm) ->
-    InnerTerm = remove(T, get(H, KVTerm, [])),
-    lists:keystore(H, 1, KVTerm, {H, InnerTerm});
+remove([H|T], KV) when is_list(KV) ->
+    InnerTerm = remove(T, get(H, KV, [])),
+    lists:keystore(H, 1, KV, {H, InnerTerm});
 
-remove([H|T], KVTerm) when is_map(KVTerm) ->
-    InnerTerm = remove(T, get(H, KVTerm, [])),
-    maps:put(H, InnerTerm, KVTerm);
+remove([H|T], KV) when is_map(KV) ->
+    InnerTerm = remove(T, get(H, KV, [])),
+    maps:put(H, InnerTerm, KV);
 
 remove([], _)  ->
     error(badkey);
 
-remove(Key, KVTerm) when is_list(KVTerm) ->
-    lists:keydelete(Key, 1, KVTerm);
+remove(Key, KV) when is_list(KV) ->
+    lists:keydelete(Key, 1, KV);
 
-remove(Key, KVTerm) when is_map(KVTerm) ->
-    maps:remove(Key, KVTerm);
+remove(Key, KV) when is_map(KV) ->
+    maps:remove(Key, KV);
 
 remove(_, _) ->
     error(badarg).
@@ -189,25 +557,25 @@ remove(_, _) ->
 %% @doc
 %% @end
 %% -----------------------------------------------------------------------------
--spec take(Key :: key(), KVTerm :: t()) ->
-    {Value :: term(), NewKVTerm :: t()} | error.
+-spec take(Key :: key(), KV :: t()) ->
+    {Value :: term(), NewKV :: t()} | error.
 
 
-take([H|[]], KVTerm) ->
-    take(H, KVTerm);
+take([H|[]], KV) ->
+    take(H, KV);
 
-take([H|T], KVTerm) when is_list(KVTerm) ->
-    case take(T, get(H, KVTerm, [])) of
+take([H|T], KV) when is_list(KV) ->
+    case take(T, get(H, KV, [])) of
         {Val, InnerTerm} ->
-            {Val, lists:keystore(H, 1, KVTerm, {H, InnerTerm})};
+            {Val, lists:keystore(H, 1, KV, {H, InnerTerm})};
         error ->
             error
     end;
 
-take([H|T], KVTerm) when is_map(KVTerm) ->
-    case take(T, get(H, KVTerm, [])) of
+take([H|T], KV) when is_map(KV) ->
+    case take(T, get(H, KV, [])) of
         {Val, InnerTerm} ->
-            {Val, maps:put(H, InnerTerm, KVTerm)};
+            {Val, maps:put(H, InnerTerm, KV)};
         error ->
             error
     end;
@@ -215,19 +583,121 @@ take([H|T], KVTerm) when is_map(KVTerm) ->
 take([], _)  ->
     error(badkey);
 
-take(Key, KVTerm) when is_list(KVTerm) ->
-    case lists:keytake(Key, 1, KVTerm) of
-        {value, {Key, Value}, NewKVTerm} ->
-            {Value, NewKVTerm};
+take(Key, KV) when is_list(KV) ->
+    case lists:keytake(Key, 1, KV) of
+        {value, {Key, Value}, NewKV} ->
+            {Value, NewKV};
         false ->
             error
     end;
 
-take(Key, KVTerm) when is_map(KVTerm) ->
-    maps:take(Key, KVTerm);
+take(Key, KV) when is_map(KV) ->
+    maps:take(Key, KV);
 
 take(_, _) ->
     error(badarg).
+
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec fold(Fun :: fold_fun(), Acc :: any(), KV :: t()) -> NewAcc :: any().
+
+fold(Fun, Acc, KV) when is_list(KV) ->
+    lists:foldl(
+        fun
+            ({K, V}, In) ->
+                Fun(K, V, In);
+            (K, In) when is_atom(K) ->
+                Fun(K, true, In)
+        end,
+        Acc,
+        KV
+    );
+
+fold(Fun, Acc, KV) when is_map(KV) ->
+    maps:fold(Fun, Acc, KV).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec foreach(Fun :: foreach_fun(), KV :: t()) -> ok.
+
+foreach(Fun, KV) when is_list(KV) ->
+    _ = lists:foreach(
+        fun
+            ({K, V}) ->
+                _ = Fun(K, V),
+                ok;
+            (K) when is_atom(K) ->
+                _ = Fun(K, true),
+                ok
+        end,
+        KV
+    ),
+    ok;
+
+foreach(Fun, KV) when is_map(KV) ->
+    maps:foreach(Fun, KV).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc
+%% @end
+%% -----------------------------------------------------------------------------
+-spec to_list(KV :: t()) -> [{key(), any()}].
+
+to_list(KV) when is_list(KV) ->
+    lists:map(
+        fun
+            ({_, _} = Pair) ->
+                Pair;
+            (K) when is_atom(K) ->
+                {K, true}
+        end,
+        KV
+    );
+
+to_list(KV) when is_map(KV) ->
+    maps:to_list(KV).
+
+
+%% -----------------------------------------------------------------------------
+%% @doc Converts the KV term to a map following the same semantics offered by
+%% {@link get/3}.
+%% @end
+%% -----------------------------------------------------------------------------
+-spec to_map(KV :: t()) -> [{key(), any()}].
+
+to_map(KV) when is_list(KV) ->
+    %% FIFO wins as in search
+    lists:foldl(
+        fun
+            ({K, V}, Acc) ->
+                case maps:is_key(K, Acc) of
+                    true ->
+                        Acc;
+                    false ->
+                        maps:put(K, V, Acc)
+                end;
+            (K, Acc) ->
+                case maps:is_key(K, Acc) of
+                    true ->
+                        Acc;
+                    false ->
+                        maps:put(K, true, Acc)
+                end
+        end,
+        #{},
+        KV
+    );
+
+to_map(KV) when is_map(KV) ->
+    KV.
 
 
 
@@ -238,11 +708,61 @@ take(_, _) ->
 
 
 %% @private
+maybe_expand(K, KV, Default) ->
+    case lists:member(K, KV) of
+        true ->
+            true;
+        false ->
+            maybe_badkey(Default)
+    end.
+
+
+%% @private
 maybe_badkey(?BADKEY) ->
     error(badkey);
 
+maybe_badkey(Fun) when is_function(Fun, 0) ->
+    Fun();
+
 maybe_badkey(Term) ->
     Term.
+
+
+
+%% @private
+do_collect([H|T], Map, Opts, Acc0) ->
+    Strategy = maps:get(on_badkey, Opts),
+
+    try
+        Default = maps:get(default, Opts),
+        %% We get the value for key or path H
+        Value = get(H, Map, Default),
+        Acc1 = collect_acc(H, Value, Opts, Acc0),
+        do_collect(T, Map, Opts, Acc1)
+    catch
+        error:badkey when Strategy == skip ->
+            do_collect(T, Map, Opts, Acc0);
+        error:badkey when Strategy == error ->
+            error({badkey, H})
+    end;
+
+do_collect([], _, _, Acc) when is_map(Acc) ->
+    Acc;
+
+do_collect([], _, _, Acc) when is_list(Acc) ->
+    lists:reverse(Acc).
+
+
+%% @private
+collect_acc(_, Value, #{?COLLECT_VALUES := true}, Acc) when is_list(Acc) ->
+    [Value | Acc];
+
+collect_acc(Key, Value, #{?COLLECT_VALUES := false}, Acc) when is_list(Acc) ->
+    [{Key, Value} | Acc];
+
+collect_acc(Key, Value, #{?COLLECT_VALUES := false}, Acc) when is_map(Acc) ->
+    key_value:put(Key, Value, Acc).
+
 
 
 
